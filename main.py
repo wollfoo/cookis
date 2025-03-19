@@ -1865,6 +1865,7 @@ class LoginVerifier:
     Cải tiến để khắc phục lỗi 'No Such Execution Context' và các vấn đề liên quan.
     """
 
+    # URL Patterns để xác định trạng thái đăng nhập
     LOGGED_IN_URL_PATTERNS = ["portal.azure.com/#home", "portal.azure.com/#blade"]
     # Mở rộng patterns để đảm bảo bắt được nhiều trường hợp đăng nhập
     ADDITIONAL_LOGGED_IN_PATTERNS = ["portal.azure.com/#view", "portal.azure.com/dashboard"]
@@ -1882,7 +1883,14 @@ class LoginVerifier:
         {"type": By.CSS_SELECTOR, "value": "div.fxs-avatarmenu", "name": "user_menu"}
     ]
     
-    def __init__(self, config: SimpleConfig, logger=None):
+    def __init__(self, config, logger=None):
+        """
+        Khởi tạo LoginVerifier
+        
+        Args:
+            config: Đối tượng cấu hình chứa URL kiểm tra đăng nhập và các thiết lập timeout
+            logger: Logger để ghi nhật ký (tùy chọn)
+        """
         self.config = config
         self.logger = logger or logging.getLogger(__name__)
         # Thêm các thuộc tính để tracking lỗi
@@ -1902,6 +1910,9 @@ class LoginVerifier:
         """
         Kiểm tra execution context của driver trước khi thực hiện các thao tác.
         
+        Args:
+            driver: WebDriver instance cần kiểm tra
+            
         Returns:
             bool: True nếu execution context còn tồn tại, False nếu đã mất.
         """
@@ -1963,6 +1974,9 @@ class LoginVerifier:
         Kiểm tra xem người dùng đã đăng nhập thành công hay chưa.
         Cải tiến để xử lý lỗi 'No Such Execution Context'.
         
+        Args:
+            driver: WebDriver instance để kiểm tra trạng thái đăng nhập
+            
         Returns:
             Tuple[bool, dict]: (đăng nhập thành công, chi tiết kiểm tra)
         """
@@ -1991,7 +2005,7 @@ class LoginVerifier:
             details["execution_context_verified"] = True
             
             # STEP 2: Kiểm tra driver còn kết nối không
-            if not verify_driver_connection(driver):
+            if not self._verify_driver_connection(driver):
                 self.logger.warning("Driver không còn kết nối. Cần khởi tạo lại.")
                 details["login_method"] = "driver_disconnected"
                 details["error"] = "WebDriver không còn kết nối"
@@ -2009,7 +2023,7 @@ class LoginVerifier:
                 # Nếu có nhiều tab, cố gắng đóng các tab dư thừa
                 if len(driver.window_handles) > 1:
                     try:
-                        close_all_tabs(driver)
+                        self._close_all_tabs(driver)
                     except WebDriverException as e:
                         self.logger.warning(f"Không thể đóng tất cả tab: {str(e)}")
                         # Thử chuyển đến tab đầu tiên nếu không đóng được
@@ -2379,12 +2393,26 @@ class LoginVerifier:
         """
         Đợi các phần tử quan trọng xuất hiện trên trang.
         Cải tiến: Kiểm tra execution context trước và trong khi đợi.
+        
+        Args:
+            driver: WebDriver instance
+            timeout: Thời gian tối đa chờ đợi (giây)
+            error_url: URL lỗi cần kiểm tra (nếu có)
+            
+        Returns:
+            str/bool: Kết quả kiểm tra (execution_context_error, error_url_detected, 
+                     no_elements_found, True nếu thành công, False nếu thất bại)
         """
         try:
             # Kiểm tra execution context trước khi bắt đầu
             if not self._check_execution_context(driver):
                 self.logger.warning("Mất execution context trước khi bắt đầu đợi phần tử")
-                return False
+                return "execution_context_error"
+            
+            # Kiểm tra URL lỗi nếu có
+            if error_url and error_url in driver.current_url.lower():
+                self.logger.warning(f"Phát hiện URL lỗi: {error_url}")
+                return "error_url_detected"
             
             self.logger.info(f"_wait_for_page_elements: Đang đợi phần tử tiêu đề xuất hiện (timeout={timeout}s)")
             
@@ -2395,139 +2423,131 @@ class LoginVerifier:
                     # Kiểm tra execution context định kỳ
                     if not self._check_execution_context(driver):
                         self.logger.warning("Mất execution context trong quá trình đợi phần tử")
-                        return False
+                        return "execution_context_error"
+                    
+                    # Kiểm tra URL lỗi định kỳ
+                    if error_url and error_url in driver.current_url.lower():
+                        self.logger.warning(f"Phát hiện URL lỗi trong quá trình đợi: {error_url}")
+                        return "error_url_detected"
                     
                     # Thử tìm một phần tử bất kỳ từ các selector
                     for selector in self.AZURE_PORTAL_SELECTORS:
                         try:
                             # Giảm timeout cho mỗi lần thử để không bị treo
-                            WebDriverWait(driver, 2).until(
-                                EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                            element = WebDriverWait(driver, 2).until(
+                                EC.presence_of_element_located((selector["type"], selector["value"]))
                             )
-                            return True  # Tìm thấy phần tử, trả về thành công
-                        except (TimeoutException, WebDriverException) as e:
+                            if element and element.is_displayed():
+                                return True  # Tìm thấy phần tử, trả về thành công
+                        except (TimeoutException, WebDriverException, StaleElementReferenceException):
                             # Lỗi nhỏ khi tìm phần tử, tiếp tục với selector khác
                             continue
                     
                     # Ngủ ngắn trước khi thử lại
                     time.sleep(0.5)
-                except NoSuchExecutionContextException:
-                    self.logger.warning("Phát hiện lỗi execution context khi đợi phần tử")
-                    return False
-                except WebDriverException as e:
-                    if "No such execution context" in str(e):
-                        self.logger.warning(f"Lỗi execution context khi đợi trang tải: {e}")
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "no such execution context" in error_msg:
+                        self.logger.warning(f"Phát hiện lỗi execution context khi đợi phần tử: {str(e)}")
+                        return "execution_context_error"
+                    elif "no such window" in error_msg:
+                        self.logger.warning(f"Phát hiện lỗi no such window khi đợi phần tử: {str(e)}")
                         return False
-                    raise
+                    else:
+                        self.logger.warning(f"Lỗi khi đợi phần tử: {type(e).__name__}: {str(e)}")
             
             # Hết thời gian timeout
             self.logger.warning("Hết thời gian đợi các phần tử trang xuất hiện")
-            return False
-        except NoSuchExecutionContextException as e:
-            self.logger.warning(f"Phát hiện lỗi execution context khi đợi phần tử: {e}")
-            return False
-        except WebDriverException as e:
-            if "No such execution context" in str(e):
-                self.logger.warning(f"Lỗi execution context khi đợi trang tải: {e}")
+            return "no_elements_found"
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "no such execution context" in error_msg:
+                self.logger.warning(f"Phát hiện lỗi execution context khi đợi phần tử: {str(e)}")
+                return "execution_context_error"
+            elif "no such window" in error_msg:
+                self.logger.warning(f"Phát hiện lỗi no such window khi đợi phần tử: {str(e)}")
                 return False
-            self.logger.error(f"Lỗi WebDriver khi đợi phần tử trang: {e}")
-            return False
+            else:
+                self.logger.error(f"Lỗi không xác định khi đợi phần tử trang: {str(e)}")
+                return False
 
-    def _safe_execute_script(self, driver, script, default_value=None):
+    def _verify_driver_connection(self, driver) -> bool:
         """
-        Thực thi JavaScript an toàn với kiểm tra execution context.
+        Xác minh WebDriver còn kết nối và hoạt động.
         
         Args:
-            driver: WebDriver instance
-            script: JavaScript cần thực thi
-            default_value: Giá trị mặc định nếu có lỗi
+            driver: WebDriver instance cần kiểm tra
             
         Returns:
-            Kết quả của script hoặc default_value nếu có lỗi
+            bool: True nếu driver còn kết nối, False nếu không
         """
-        if not self._check_execution_context(driver):
-            return default_value
+        if not driver:
+            return False
             
         try:
-            return driver.execute_script(script)
-        except Exception as e:
-            self.logger.debug(f"Lỗi khi thực thi script an toàn: {str(e)}")
-            return default_value
-
-    def _safe_wait_for_condition(self, driver, condition, timeout=10):
-        """
-        Đợi một điều kiện với kiểm tra execution context liên tục.
-        
-        Args:
-            driver: WebDriver instance
-            condition: Hàm điều kiện, nhận driver và trả về Boolean
-            timeout: Thời gian tối đa chờ đợi (giây)
-            
-        Returns:
-            bool: True nếu điều kiện thỏa mãn, False nếu timeout
-        """
-        start_time = time.time()
-        check_interval = 0.5
-        
-        while time.time() - start_time < timeout:
-            # Kiểm tra execution context trước khi kiểm tra điều kiện
+            # Kiểm tra execution context
             if not self._check_execution_context(driver):
-                self.logger.debug("Mất execution context khi đợi điều kiện")
                 return False
                 
-            try:
-                if condition(driver):
-                    return True
-            except Exception as e:
-                self.logger.debug(f"Lỗi khi kiểm tra điều kiện: {str(e)}")
+            # Kiểm tra session_id
+            if not hasattr(driver, 'session_id') or not driver.session_id:
+                return False
                 
-            time.sleep(check_interval)
-            
-        return False
+            # Kiểm tra window_handles
+            try:
+                handles = driver.window_handles
+                if not handles:
+                    return False
+            except Exception:
+                return False
+                
+            return True
+        except Exception as e:
+            self.logger.debug(f"Lỗi khi xác minh kết nối driver: {str(e)}")
+            return False
 
-    def _wait_for_page_load_safely(self, driver, timeout=15):
+    def _close_all_tabs(self, driver) -> bool:
         """
-        Đợi trang load với kiểm tra execution context liên tục.
+        Đóng tất cả tab ngoại trừ tab đầu tiên.
         
         Args:
             driver: WebDriver instance
-            timeout: Thời gian tối đa chờ đợi (giây)
             
         Returns:
-            bool: True nếu trang đã load, False nếu timeout hoặc lỗi
+            bool: True nếu thành công, False nếu thất bại
         """
-        self.logger.debug(f"Đợi trang load, timeout={timeout}s")
-        
-        # Không sử dụng wait_for_page_load trực tiếp để tránh mất context
         try:
-            # Đợi document readyState
-            ready_state_condition = lambda d: d.execute_script("return document.readyState") in ["complete", "interactive"]
+            handles = driver.window_handles
             
-            if self._safe_wait_for_condition(driver, ready_state_condition, timeout):
-                self.logger.debug("document.readyState báo trang đã load")
+            # Nếu không có cửa sổ nào
+            if not handles:
+                return False
                 
-                # Kiểm tra thêm các phần tử quan trọng của trang
-                try:
-                    for selector in ["body", "header", "nav", "main", "div", "script", "html"]:
-                        element_present = lambda d: len(d.find_elements(By.TAG_NAME, selector)) > 0
-                        if self._safe_wait_for_condition(driver, element_present, 2):
-                            self.logger.debug(f"Phát hiện phần tử {selector} trên trang")
-                            return True
-                except Exception:
-                    # Nếu không tìm thấy phần tử nào cũng không sao
-                    pass
-                    
-                # Trang đã load theo readyState
+            # Nếu chỉ có một cửa sổ, không cần đóng
+            if len(handles) <= 1:
                 return True
+                
+            # Chuyển về tab đầu tiên
+            main_window = handles[0]
+            driver.switch_to.window(main_window)
             
-            self.logger.debug("Timeout khi đợi trang load")
-            return False
+            # Đóng các tab khác
+            for handle in handles[1:]:
+                try:
+                    driver.switch_to.window(handle)
+                    driver.close()
+                except Exception as e:
+                    self.logger.debug(f"Không thể đóng tab {handle}: {str(e)}")
             
+            # Chuyển lại về tab đầu tiên
+            driver.switch_to.window(main_window)
+            return True
         except Exception as e:
-            self.logger.warning(f"Lỗi khi đợi trang load: {str(e)}")
+            self.logger.warning(f"Lỗi khi đóng tất cả tab: {str(e)}")
             return False
 
-    def _adaptive_sleep(self, duration, driver):
+    def _adaptive_sleep(self, duration, driver) -> bool:
         """
         Sleep thích ứng với kiểm tra execution context định kỳ.
         
@@ -2556,7 +2576,7 @@ class LoginVerifier:
                 
         return True
 
-    def _determine_optimal_wait_time(self, driver, current_url):
+    def _determine_optimal_wait_time(self, driver, current_url) -> float:
         """
         Xác định thời gian chờ tối ưu dựa trên tình trạng trang.
         
@@ -2611,71 +2631,364 @@ class LoginVerifier:
             
         return wait_time
 
-    def _evaluate_verification_result(self, details):
+    def _wait_for_page_load_safely(self, driver, timeout=15):
         """
-        Đánh giá kết quả xác thực và cung cấp thông tin hữu ích cho triển khai.
+        Đợi trang load với kiểm tra execution context liên tục.
         
         Args:
-            details: Dictionary chứa chi tiết kết quả
-        """
-        # Thêm các thông tin hữu ích cho debugging và cải thiện hệ thống
-        try:
-            elapsed_ms = details.get("total_execution_time_ms", 0)
-            
-            if details.get("api_check_status", False):
-                # Đánh giá kết quả thành công
-                details["evaluation"] = {
-                    "result_quality": "good" if details.get("user_id") and details.get("display_name") else "partial",
-                    "time_assessment": "fast" if elapsed_ms < 5000 else "normal" if elapsed_ms < 10000 else "slow",
-                    "recommendations": []
-                }
-                
-                # Ghi nhận nếu có data_source để cải thiện hệ thống
-                if details.get("data_source"):
-                    details["evaluation"]["successful_data_source"] = details.get("data_source")
-                    
-            else:
-                # Đánh giá kết quả thất bại
-                details["evaluation"] = {
-                    "failure_cause": self._determine_failure_cause(details),
-                    "time_assessment": "fast" if elapsed_ms < 3000 else "normal" if elapsed_ms < 7000 else "slow",
-                    "recommendations": ["retry_with_different_profile" if "execution_context" in details.get("api_error", "") else "try_login_check_first"]
-                }
-                
-        except Exception as e:
-            self.logger.debug(f"Lỗi khi đánh giá kết quả: {str(e)}")
-
-    def _determine_failure_cause(self, details):
-        """
-        Xác định nguyên nhân chính khiến xác thực thất bại.
-        
-        Args:
-            details: Dictionary chứa chi tiết kết quả
+            driver: WebDriver instance
+            timeout: Thời gian tối đa chờ đợi (giây)
             
         Returns:
-            str: Mô tả nguyên nhân thất bại chính
+            bool: True nếu trang đã load, False nếu timeout hoặc lỗi
         """
-        error_msg = details.get("api_error", "").lower()
+        self.logger.debug(f"Đợi trang load, timeout={timeout}s")
         
-        if "execution_context" in error_msg:
-            return "execution_context_lost"
-        elif "window" in error_msg:
-            return "window_closed"
-        elif "không tìm thấy thông tin người dùng" in error_msg or "không có dữ liệu" in error_msg:
-            return "no_user_data_found"
-        elif "không thể truy cập storage" in error_msg:
-            return "storage_access_failed"
-        elif "navigation" in error_msg or "điều hướng" in error_msg:
-            return "navigation_failed"
-        elif "timeout" in error_msg:
-            return "timeout"
-        else:
-            return "unknown"
+        # Không sử dụng wait_for_page_load trực tiếp để tránh mất context
+        try:
+            # Đợi document readyState
+            ready_state_condition = lambda d: d.execute_script("return document.readyState") in ["complete", "interactive"]
+            
+            if self._safe_wait_for_condition(driver, ready_state_condition, timeout):
+                self.logger.debug("document.readyState báo trang đã load")
+                
+                # Kiểm tra thêm các phần tử quan trọng của trang
+                try:
+                    for selector in ["body", "header", "nav", "main", "div", "script", "html"]:
+                        element_present = lambda d: len(d.find_elements(By.TAG_NAME, selector)) > 0
+                        if self._safe_wait_for_condition(driver, element_present, 2):
+                            self.logger.debug(f"Phát hiện phần tử {selector} trên trang")
+                            return True
+                except Exception:
+                    # Nếu không tìm thấy phần tử nào cũng không sao
+                    pass
+                    
+                # Trang đã load theo readyState
+                return True
+            
+            self.logger.debug("Timeout khi đợi trang load")
+            return False
+            
+        except Exception as e:
+            self.logger.warning(f"Lỗi khi đợi trang load: {str(e)}")
+            return False
+
+    def _safe_wait_for_condition(self, driver, condition, timeout=10):
+        """
+        Đợi một điều kiện với kiểm tra execution context liên tục.
+        
+        Args:
+            driver: WebDriver instance
+            condition: Hàm điều kiện, nhận driver và trả về Boolean
+            timeout: Thời gian tối đa chờ đợi (giây)
+            
+        Returns:
+            bool: True nếu điều kiện thỏa mãn, False nếu timeout
+        """
+        start_time = time.time()
+        check_interval = 0.5
+        
+        while time.time() - start_time < timeout:
+            # Kiểm tra execution context trước khi kiểm tra điều kiện
+            if not self._check_execution_context(driver):
+                self.logger.debug("Mất execution context khi đợi điều kiện")
+                return False
+                
+            try:
+                if condition(driver):
+                    return True
+            except Exception as e:
+                self.logger.debug(f"Lỗi khi kiểm tra điều kiện: {str(e)}")
+                
+            time.sleep(check_interval)
+            
+        return False
+
+    def get_error_metrics(self) -> Dict:
+        """
+        Lấy thông tin về các lỗi đã xảy ra trong quá trình xác thực.
+        
+        Returns:
+            Dict: Thông tin chi tiết về các lỗi
+        """
+        return {
+            "execution_context_errors": self.error_counts["execution_context"],
+            "navigation_errors": self.error_counts["navigation"],
+            "page_load_timeout": self.error_counts["page_load_timeout"],
+            "no_such_window": self.error_counts["no_such_window"],
+            "other_errors": self.error_counts["other_errors"],
+            "last_verification_time": self.last_verification_time,
+            "successful_patterns": self.successful_patterns
+        }
+
+    def reset_error_metrics(self):
+        """
+        Đặt lại các bộ đếm lỗi.
+        """
+        self.error_counts = {
+            "execution_context": 0,
+            "navigation": 0,
+            "page_load_timeout": 0,
+            "no_such_window": 0,
+            "other_errors": 0
+        }
+        
+    def is_healthy(self) -> bool:
+        """
+        Kiểm tra xem LoginVerifier có đang trong trạng thái hoạt động tốt không.
+        
+        Returns:
+            bool: True nếu ít lỗi, False nếu quá nhiều lỗi.
+        """
+        # Nếu có quá nhiều lỗi execution_context, coi như không healthy
+        if self.error_counts["execution_context"] > 10:
+            return False
+            
+        # Nếu tổng số lỗi quá nhiều, coi như không healthy
+        total_errors = sum(self.error_counts.values())
+        if total_errors > 20:
+            return False
+            
+        return True
+
+# --- API Verifier ---
+class ApiVerifier:
+    """
+    Lớp chuyên trách xác thực thông tin người dùng qua localStorage và sessionStorage.
+    Phiên bản tối ưu tập trung vào việc trích xuất thông tin tài khoản Azure AD thông qua
+    dữ liệu lưu trữ trong trình duyệt.
+    """
+    def __init__(self, config: SimpleConfig, logger=None):
+        self.config = config
+        self.logger = logger or logging.getLogger(__name__)
+
+    @retry_with_backoff(max_retries=2, initial_delay=1, backoff_factor=2, jitter=True)
+    def verify_user_data(self, driver: webdriver.Chrome) -> Tuple[bool, Dict]:
+        """
+        Xác thực thông tin người dùng bằng cách trích xuất dữ liệu từ localStorage và sessionStorage.
+        Tối ưu: Không tải lại trang nếu đã ở URL Azure Portal.
+        
+        Logic kiểm tra:
+        1. Kiểm tra nếu đã ở trang Azure Portal, không cần tải lại trang
+        2. Nếu chưa ở trang Portal, điều hướng đến trang Azure Portal
+        3. Trích xuất thông tin người dùng từ storage của trình duyệt
+        4. Xác thực tính hợp lệ của tài khoản dựa trên định dạng UUID của userId
+        
+        Returns:
+            Tuple[bool, Dict]: (verification_success, details)
+        """
+        details = {
+            "api_check_status": False,
+            "user_id": None,
+            "display_name": None,
+            "domain_name": None,
+            "data_source": None,
+            "api_error": None,
+            "execution_steps": []
+        }
+        
+        # Lưu trữ original_level để khôi phục sau khi xử lý
+        original_level = self.logger.level
+        
+        try:
+            # Tăng log level tạm thời để xem chi tiết hơn
+            self.logger.setLevel(logging.DEBUG)
+            details["execution_steps"].append("logger_level_set_to_debug")
+            
+            # Ghi nhận thời gian bắt đầu
+            start_time = time.time()
+            self.logger.info(f"verify_user_data: Bắt đầu xác thực người dùng ({start_time})")
+            details["execution_steps"].append(f"start:{int(start_time*1000)}")
+            
+            # Kiểm tra driver còn kết nối không
+            if not verify_driver_connection(driver):
+                self.logger.warning("Driver không còn kết nối khi kiểm tra API")
+                details["api_error"] = "WebDriver không còn kết nối"
+                return False, details
+            
+            # Ghi nhận bắt đầu quá trình xác thực
+            self.logger.info("Bắt đầu quá trình xác thực API")
+            details["execution_steps"].append("verification_started")
+            
+            # THAY ĐỔI: Kiểm tra URL hiện tại trước khi điều hướng
+            portal_url = "https://portal.azure.com/"
+            current_url = ""
+            
+            try:
+                current_url = driver.current_url
+                details["current_url"] = current_url
+                
+                # Kiểm tra xem đã ở trang Azure Portal chưa
+                already_on_portal = "portal.azure.com" in current_url.lower()
+                
+                if already_on_portal:
+                    self.logger.info(f"Đã ở trang Azure Portal: {current_url}")
+                    details["execution_steps"].append("already_on_portal")
+                else:
+                    self.logger.info(f"Chưa ở trang Azure Portal, đang ở: {current_url}")
+                    details["execution_steps"].append(f"not_on_portal:{current_url}")
+                    
+                    # Điều hướng đến Azure Portal nếu chưa ở đó
+                    self.logger.info(f"Truy cập Azure Portal: {portal_url}")
+                    details["execution_steps"].append(f"accessing_portal:{portal_url}")
+                    
+                    try:
+                        if is_shutdown_requested():
+                            raise RuntimeError("Shutdown requested - dừng driver.get")
+                            
+                        driver.get(portal_url)
+                        details["execution_steps"].append("portal_access_started")
+                    except WebDriverException as e:
+                        self.logger.warning(f"Lỗi khi điều hướng đến {portal_url}: {str(e)}")
+                        details["api_error"] = f"Lỗi điều hướng: {str(e)}"
+                        return False, details
+                    
+                    # Chờ trang load
+                    self.logger.info("Đang chờ trang load...")
+                    page_load_timeout = self.config.get_timeout("page_load", 15)
+                    
+                    loaded = wait_for_page_load(
+                        driver, 
+                        timeout=page_load_timeout,
+                        check_js_complete=True,
+                        check_network_idle=True
+                    )
+                    
+                    if not loaded:
+                        self.logger.warning(f"Timeout {page_load_timeout}s khi chờ trang load")
+                        details["api_error"] = f"Trang không load xong trong {page_load_timeout}s"
+                        return False, details
+            except WebDriverException as e:
+                self.logger.warning(f"Lỗi khi kiểm tra URL hiện tại: {str(e)}")
+                details["api_error"] = f"Lỗi kiểm tra URL: {str(e)}"
+                return False, details
+            
+            # Kiểm tra các phần tử tiêu đề xuất hiện - dù ở trang Portal sẵn hay mới chuyển đến
+            self.logger.info("Đang kiểm tra các phần tử chính của trang...")
+            details["execution_steps"].append("checking_dom_elements")
+            
+            # Đợi các phần tử h1, h2 xuất hiện
+            element_found = False
+            try:
+                # Đợi các phần tử h1 hoặc h2 với timeout ngắn hơn nếu đã ở trang Portal
+                timeout = 5 if "portal.azure.com" in current_url.lower() else 10
+                shorter_wait = WebDriverWait(driver, timeout)
+                
+                # Thử tìm h1 trước
+                try:
+                    h1_element = shorter_wait.until(
+                        EC.presence_of_element_located((By.TAG_NAME, "h1"))
+                    )
+                    element_found = True
+                    self.logger.info(f"Đã tìm thấy phần tử h1: {h1_element.text}")
+                    details["execution_steps"].append("h1_element_found")
+                    details["page_h1_text"] = h1_element.text
+                except Exception as h1_error:
+                    self.logger.debug(f"Không tìm thấy phần tử h1: {str(h1_error)}")
+                    
+                    # Nếu không tìm thấy h1, thử tìm h2
+                    if not element_found:
+                        try:
+                            h2_element = shorter_wait.until(
+                                EC.presence_of_element_located((By.TAG_NAME, "h2"))
+                            )
+                            element_found = True
+                            self.logger.info(f"Đã tìm thấy phần tử h2: {h2_element.text}")
+                            details["execution_steps"].append("h2_element_found")
+                            details["page_h2_text"] = h2_element.text
+                        except Exception as h2_error:
+                            self.logger.debug(f"Không tìm thấy phần tử h2: {str(h2_error)}")
+                
+                # Nếu không tìm thấy h1 hoặc h2, thử tìm bất kỳ phần tử nào khác
+                if not element_found:
+                    try:
+                        # Thử tìm bất kỳ phần tử quan trọng nào
+                        any_element = shorter_wait.until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, "div.fxs-blade-content"))
+                        )
+                        element_found = True
+                        self.logger.info("Đã tìm thấy phần tử nội dung trang Azure Portal")
+                        details["execution_steps"].append("content_element_found")
+                    except Exception as any_error:
+                        self.logger.warning(f"Không tìm thấy phần tử nội dung chính: {str(any_error)}")
+                
+            except Exception as element_error:
+                self.logger.warning(f"Lỗi khi kiểm tra các phần tử DOM: {str(element_error)}")
+                details["execution_steps"].append("dom_element_check_error")
+            
+            # Lấy thông tin trang hiện tại sau khi đã điều hướng hoặc kiểm tra
+            try:
+                current_url = driver.current_url
+                page_title = driver.title
+                details["current_url"] = current_url
+                details["page_title"] = page_title
+                self.logger.info(f"Trang hiện tại: URL={current_url}, Title={page_title}")
+            except Exception as e:
+                self.logger.debug(f"Không lấy được thông tin trang: {str(e)}")
+            
+            # Đợi thêm thời gian ngắn (1s) nếu đã ở trang portal, nếu không thì đợi lâu hơn (2s)
+            if "portal.azure.com" in current_url.lower():
+                time.sleep(1)
+            else:
+                time.sleep(2)
+            details["execution_steps"].append("portal_verified")
+            
+            # Ghi nhận bắt đầu quá trình xác thực qua storage
+            self.logger.info("=== Bắt đầu kiểm tra API bằng dữ liệu storage ===")
+            details["execution_steps"].append("storage_verification_start")
+            verification_start = time.time()
+            
+            # Thực hiện xác thực từ storage
+            api_success, api_details = self._get_data_from_storage(driver)
+            
+            # Ghi nhận kết quả
+            verification_duration = time.time() - verification_start
+            details["verification_duration_ms"] = verification_duration * 1000
+            self.logger.info(f"Kiểm tra API đã thực thi trong {verification_duration:.3f}s")
+            details["execution_steps"].append(f"verification_complete:{verification_duration:.3f}s")
+            
+            # Cập nhật kết quả
+            details.update(api_details)
+            elapsed = time.time() - start_time
+            
+            if api_success:
+                self.logger.info(f"Kiểm tra API thành công ({elapsed:.2f}s)")
+                details["execution_steps"].append("verification_success")
+            else:
+                self.logger.warning(f"Kiểm tra API thất bại: {api_details.get('api_error', 'Không rõ lý do')}")
+                details["execution_steps"].append("verification_failed")
+            
+            # Tổng kết thời gian xử lý
+            details["total_execution_time_ms"] = elapsed * 1000
+            details["execution_steps"].append(f"complete:{int(time.time()*1000)}")
+            
+            return api_success, details
+                
+        except InvalidSessionIdException as e:
+            error_msg = f"Phiên webdriver không hợp lệ: {str(e)}"
+            self.logger.warning(error_msg)
+            details["api_error"] = error_msg
+            details["execution_steps"].append("invalid_session_error")
+            return False, details
+            
+        except Exception as e:
+            error_msg = f"Lỗi kiểm tra API: {e.__class__.__name__}: {str(e)}"
+            self.logger.error(error_msg)
+            details["api_error"] = error_msg
+            details["execution_steps"].append(f"unexpected_error:{e.__class__.__name__}")
+            return False, details
+        
+        finally:
+            # Khôi phục logger level ban đầu
+            try:
+                self.logger.setLevel(original_level)
+            except:
+                pass
 
     def _get_data_from_storage(self, driver: webdriver.Chrome) -> Tuple[bool, Dict]:
         """
         Lấy dữ liệu người dùng từ localStorage và sessionStorage.
-        Phiên bản tối ưu tập trung vào nhiều pattern lưu trữ khác nhau của Azure AD.
+        Phiên bản tối ưu tập trung vào trích xuất dữ liệu từ storage.
         
         Returns:
             Tuple[bool, Dict]: (verification_success, details)
@@ -2696,7 +3009,7 @@ class LoginVerifier:
         
         try:
             # Tăng script timeout để tránh lỗi timeout
-            driver.set_script_timeout(15)  # Tăng từ 10s lên 15s
+            driver.set_script_timeout(10)  # Tăng timeout từ 5s lên 10s
             
             # Kiểm tra truy cập storage
             try:
@@ -2729,7 +3042,7 @@ class LoginVerifier:
                 self.logger.warning(f"Lỗi kiểm tra storage: {str(storage_error)}")
                 return False, details
             
-            # SCRIPT CẢI TIẾN: Thêm nhiều cách trích xuất dữ liệu hơn và debug chi tiết
+            # Script tối ưu - CHỈ TRUY CẬP localStorage và sessionStorage
             optimized_script = r"""
             function extractCriticalAzureData() {
                 // Kết quả
@@ -2737,14 +3050,11 @@ class LoginVerifier:
                     user: {
                         userId: null,
                         displayName: null,
-                        email: null,
-                        upn: null,
-                        alternativeIds: []
+                        email: null
                     },
                     tenant: {
                         id: null,
-                        domain: null,
-                        alternativeDomains: []
+                        domain: null
                     },
                     isValid: false,
                     dataSources: [],
@@ -2752,621 +3062,203 @@ class LoginVerifier:
                     debug: {
                         localStorage: {},
                         sessionStorage: {},
-                        storage_scan: {
-                            localStorage: {
-                                keysFound: [],
-                                userRelatedKeysFound: []
-                            },
-                            sessionStorage: {
-                                keysFound: [],
-                                userRelatedKeysFound: [],
-                                accountKeys: [],
-                                tokenKeys: []
-                            }
-                        },
-                        errors: [],
-                        timing: {
-                            start: Date.now()
-                        }
+                        errors: []
                     }
                 };
 
                 try {
-                    // PHẦN MỚI: Quét toàn bộ localStorage và sessionStorage để tìm khóa liên quan
-                    // Tiện lợi khi cấu trúc Azure Portal thay đổi
+                    // Log các key quan trọng
+                    const importantLocalStorageKeys = ['SavedDefaultDirectory', 'AzurePortalDiscriminator', 'preferred-domain'];
+                    const importantSessionStorageKeys = ['msal.account.keys', 'msal.token.keys'];
                     
-                    // 0. Quét tất cả keys trong localStorage
-                    result.debug.storage_scan.localStorage.keysFound = Object.keys(localStorage);
-                    
-                    // Tìm các key có thể chứa thông tin người dùng
-                    result.debug.storage_scan.localStorage.userRelatedKeysFound = Object.keys(localStorage).filter(key => {
-                        const lowerKey = key.toLowerCase();
-                        return lowerKey.includes('user') || 
-                               lowerKey.includes('account') || 
-                               lowerKey.includes('profile') || 
-                               lowerKey.includes('auth') ||
-                               lowerKey.includes('tenant') ||
-                               lowerKey.includes('directory') ||
-                               lowerKey.includes('domain') ||
-                               lowerKey.includes('token') ||
-                               lowerKey.includes('login');
+                    // Lưu keys đã tìm thấy để debug
+                    importantLocalStorageKeys.forEach(key => {
+                        const value = localStorage.getItem(key);
+                        result.debug.localStorage[key] = value ? "found" : "not found";
                     });
                     
-                    // 0.1 Quét tất cả keys trong sessionStorage
-                    result.debug.storage_scan.sessionStorage.keysFound = Object.keys(sessionStorage);
-                    
-                    // Tìm các key có thể chứa thông tin người dùng
-                    result.debug.storage_scan.sessionStorage.userRelatedKeysFound = Object.keys(sessionStorage).filter(key => {
-                        const lowerKey = key.toLowerCase();
-                        return lowerKey.includes('user') || 
-                               lowerKey.includes('account') || 
-                               lowerKey.includes('profile') || 
-                               lowerKey.includes('auth') ||
-                               lowerKey.includes('tenant') ||
-                               lowerKey.includes('directory') ||
-                               lowerKey.includes('domain') ||
-                               lowerKey.includes('token') ||
-                               lowerKey.includes('login') ||
-                               lowerKey.includes('msal');
+                    importantSessionStorageKeys.forEach(key => {
+                        // Tìm tất cả keys khớp với pattern
+                        Object.keys(sessionStorage).forEach(storageKey => {
+                            if (storageKey.includes(key)) {
+                                result.debug.sessionStorage[storageKey] = "found";
+                            }
+                        });
                     });
                     
-                    // Các key liên quan đến account và token đặc biệt
-                    result.debug.storage_scan.sessionStorage.accountKeys = Object.keys(sessionStorage).filter(key => 
-                        key.includes('account') && !key.includes('account.keys')
-                    );
-                    
-                    result.debug.storage_scan.sessionStorage.tokenKeys = Object.keys(sessionStorage).filter(key => 
-                        key.includes('token') && !key.includes('token.keys')
-                    );
-
-                    // 1. CHIẾN LƯỢC MỚI: Phân tích từng phương pháp trích xuất riêng biệt để dễ debug
-                    
-                    // 1.1 Phương pháp trực tiếp từ localStorage (đơn giản nhất)
-                    try {
-                        // SavedDefaultDirectory thường chứa tenant ID
-                        const tenantId = localStorage.getItem('SavedDefaultDirectory');
-                        if (tenantId) {
-                            result.tenant.id = tenantId;
-                            result.dataSources.push('localStorage.SavedDefaultDirectory');
-                        }
-                        
-                        // Thử lấy tenantId từ các key liên quan đến tenant
-                        if (!result.tenant.id) {
-                            const tenantKeys = result.debug.storage_scan.localStorage.userRelatedKeysFound.filter(k => 
-                                k.toLowerCase().includes('tenant') || k.toLowerCase().includes('directory')
-                            );
-                            
-                            for (const key of tenantKeys) {
-                                try {
-                                    const value = localStorage.getItem(key);
-                                    if (value && (value.length === 36 || value.includes('-'))) {
-                                        result.tenant.id = value;
-                                        result.dataSources.push(`localStorage.${key}`);
-                                        break;
-                                    }
-                                } catch (e) {
-                                    result.debug.errors.push(`Error reading localStorage.${key}: ${e.message}`);
-                                }
-                            }
-                        }
-                        
-                        // Lấy domain từ các key liên quan
-                        const domainKeys = ['preferred-domain', 'preferredDomain', 'domain', 'tenantDomain'];
-                        for (const key of domainKeys) {
-                            const domain = localStorage.getItem(key);
-                            if (domain && domain.includes('.')) {
-                                result.tenant.domain = domain;
-                                result.dataSources.push(`localStorage.${key}`);
-                                break;
-                            }
-                        }
-                        
-                        // Tìm các key chứa thông tin người dùng dạng JSON
-                        const userProfileKeys = result.debug.storage_scan.localStorage.userRelatedKeysFound.filter(k => 
-                            k.toLowerCase().includes('user') || k.toLowerCase().includes('profile')
-                        );
-                        
-                        for (const key of userProfileKeys) {
-                            try {
-                                const value = localStorage.getItem(key);
-                                if (value && value.startsWith('{')) {
-                                    const userData = JSON.parse(value);
-                                    
-                                    // Tìm displayName hoặc name
-                                    if (!result.user.displayName && (userData.displayName || userData.name)) {
-                                        result.user.displayName = userData.displayName || userData.name;
-                                        result.dataSources.push(`localStorage.${key}.displayName`);
-                                    }
-                                    
-                                    // Tìm email hoặc upn
-                                    if (!result.user.email && (userData.email || userData.upn || userData.userPrincipalName)) {
-                                        result.user.email = userData.email || userData.upn || userData.userPrincipalName;
-                                        result.dataSources.push(`localStorage.${key}.email`);
-                                    }
-                                    
-                                    // Tìm userId hoặc oid
-                                    if (!result.user.userId && (userData.userId || userData.oid || userData.objectId)) {
-                                        result.user.userId = userData.userId || userData.oid || userData.objectId;
-                                        result.dataSources.push(`localStorage.${key}.userId`);
-                                    }
-                                }
-                            } catch (e) {
-                                // Bỏ qua lỗi phân tích JSON
-                                result.debug.errors.push(`Error parsing localStorage.${key}: ${e.message}`);
-                            }
-                        }
-                        
-                    } catch (localStorageError) {
-                        result.debug.errors.push(`LocalStorage extract error: ${localStorageError.message}`);
+                    // 1. Lấy tenantId từ localStorage
+                    result.tenant.id = localStorage.getItem('SavedDefaultDirectory') || null;
+                    if (result.tenant.id) {
+                        result.dataSources.push('localStorage.SavedDefaultDirectory');
                     }
-                    
-                    // 2. Phương pháp từ sessionStorage - MSAL Account Keys (phương pháp chính)
+
+                    // 2. Lấy thông tin từ tài khoản trong sessionStorage
+                    let accountKeys = [];
                     try {
-                        // Tìm tất cả keys liên quan đến account 
-                        let accountKeysFound = false;
-                        let accountKeys = [];
-                        
-                        // 2.1 Thử tìm qua msal.account.keys (chuẩn)
                         const accountKeysStr = sessionStorage.getItem('msal.account.keys');
                         if (accountKeysStr) {
-                            try {
-                                accountKeys = JSON.parse(accountKeysStr);
-                                accountKeysFound = true;
-                                result.debug.sessionStorage['msal.account.keys_parsed'] = true;
-                            } catch (e) {
-                                result.debug.errors.push(`Error parsing msal.account.keys: ${e.message}`);
-                            }
-                        }
-                        
-                        // 2.2 Nếu không tìm thấy qua msal.account.keys, tìm qua các pattern khác
-                        if (!accountKeysFound) {
-                            // Tìm kiếm các key có chứa 'account.keys' hoặc tương tự
-                            const accountKeyPattern = Object.keys(sessionStorage).filter(key => 
-                                key.includes('account.keys') || 
-                                key.includes('accounts.keys') ||
-                                key.includes('accountkeys')
-                            );
-                            
-                            for (const keyPattern of accountKeyPattern) {
-                                try {
-                                    const data = sessionStorage.getItem(keyPattern);
-                                    if (data) {
-                                        const keysData = JSON.parse(data);
+                            accountKeys = JSON.parse(accountKeysStr);
+                            result.debug.sessionStorage['msal.account.keys_parsed'] = true;
+                        } else {
+                            // Tìm kiếm các key có chứa 'account.keys'
+                            Object.keys(sessionStorage).forEach(key => {
+                                if (key.includes('account.keys')) {
+                                    try {
+                                        const keysData = JSON.parse(sessionStorage.getItem(key));
                                         if (Array.isArray(keysData) && keysData.length > 0) {
                                             accountKeys = keysData;
-                                            accountKeysFound = true;
-                                            result.debug.sessionStorage['alternative_account_keys'] = keyPattern;
-                                            break;
+                                            result.debug.sessionStorage['alternative_account_keys'] = key;
                                         }
+                                    } catch (e) {
+                                        result.debug.errors.push("Error parsing alternative account keys: " + e.message);
                                     }
-                                } catch (e) {
-                                    result.debug.errors.push(`Error parsing alternative account key ${keyPattern}: ${e.message}`);
                                 }
-                            }
+                            });
                         }
-                        
-                        // 2.3 Nếu vẫn không tìm thấy, tìm trực tiếp các key phù hợp với pattern
-                        if (!accountKeysFound) {
-                            const directAccountKeys = result.debug.storage_scan.sessionStorage.accountKeys;
-                            if (directAccountKeys.length > 0) {
-                                accountKeys = directAccountKeys;
-                                accountKeysFound = true;
-                                result.debug.sessionStorage['direct_account_keys_found'] = directAccountKeys.length;
-                            }
-                        }
-                        
-                        // 2.4 Xử lý dữ liệu account nếu đã tìm thấy accountKeys
-                        if (accountKeysFound && accountKeys.length > 0) {
-                            // Lưu danh sách keys tìm thấy để debug
-                            result.debug.sessionStorage['account_keys_found'] = accountKeys;
+                    } catch (e) {
+                        result.debug.errors.push("Error parsing account keys: " + e.message);
+                    }
+
+                    if (accountKeys.length > 0) {
+                        const accountKey = accountKeys[0];
+                        try {
+                            const accountData = JSON.parse(sessionStorage.getItem(accountKey) || '{}');
+                            result.debug.sessionStorage['account_data_parsed'] = true;
                             
-                            // Phân tích từng account key
-                            for (const accountKey of accountKeys) {
-                                try {
-                                    const accountDataStr = sessionStorage.getItem(accountKey);
-                                    if (!accountDataStr) continue;
-                                    
-                                    const accountData = JSON.parse(accountDataStr);
-                                    result.debug.sessionStorage[`account_data_for_${accountKey.substring(0, 20)}`] = 'parsed';
-                                    
-                                    // Check IdP - xác định tài khoản cá nhân
-                                    if (accountData.idTokenClaims && accountData.idTokenClaims.idp) {
-                                        result.idp = accountData.idTokenClaims.idp;
-                                    }
-                                    
-                                    // Trích xuất userId - ưu tiên oid từ idTokenClaims
-                                    if (accountData.idTokenClaims && accountData.idTokenClaims.oid) {
-                                        result.user.userId = accountData.idTokenClaims.oid;
-                                        result.dataSources.push('accountData.idTokenClaims.oid');
-                                    } else if (accountData.localAccountId) {
-                                        result.user.userId = accountData.localAccountId;
-                                        result.dataSources.push('accountData.localAccountId');
-                                    } else if (accountData.homeAccountId) {
-                                        // Trong một số trường hợp, homeAccountId có thể chứa oid
-                                        const parts = accountData.homeAccountId.split('.');
-                                        if (parts.length > 0 && parts[0].length === 36) {
-                                            result.user.userId = parts[0];
-                                            result.dataSources.push('accountData.homeAccountId');
-                                        }
-                                    }
-                                    
-                                    // Lưu các ID thay thế cho việc debug
-                                    if (accountData.localAccountId || accountData.homeAccountId) {
-                                        result.user.alternativeIds.push({
-                                            localAccountId: accountData.localAccountId,
-                                            homeAccountId: accountData.homeAccountId
-                                        });
-                                    }
-                                    
-                                    // Trích xuất displayName - ưu tiên name từ idTokenClaims
-                                    if (accountData.idTokenClaims && accountData.idTokenClaims.name) {
-                                        result.user.displayName = accountData.idTokenClaims.name;
-                                        result.dataSources.push('accountData.idTokenClaims.name');
-                                    } else if (accountData.name) {
-                                        result.user.displayName = accountData.name;
-                                        result.dataSources.push('accountData.name');
-                                    }
-                                    
-                                    // Trích xuất email/username/upn
-                                    if (accountData.idTokenClaims && accountData.idTokenClaims.upn) {
-                                        result.user.upn = accountData.idTokenClaims.upn;
-                                        if (!result.user.email) {
-                                            result.user.email = accountData.idTokenClaims.upn;
-                                            result.dataSources.push('accountData.idTokenClaims.upn');
-                                        }
-                                    }
-                                    
-                                    if (accountData.idTokenClaims && accountData.idTokenClaims.email && !result.user.email) {
-                                        result.user.email = accountData.idTokenClaims.email;
-                                        result.dataSources.push('accountData.idTokenClaims.email');
-                                    }
-                                    
-                                    if (accountData.username && !result.user.email) {
-                                        result.user.email = accountData.username;
-                                        result.dataSources.push('accountData.username');
-                                    }
-                                    
-                                    // Lấy domain từ email nếu chưa có
-                                    if (!result.tenant.domain && result.user.email && result.user.email.includes('@')) {
-                                        result.tenant.domain = result.user.email.split('@')[1];
-                                        result.dataSources.push('email_domain');
-                                    }
-                                    
-                                    // Lấy tenantId từ idTokenClaims nếu chưa có
-                                    if (!result.tenant.id && accountData.idTokenClaims && accountData.idTokenClaims.tid) {
-                                        result.tenant.id = accountData.idTokenClaims.tid;
-                                        result.dataSources.push('accountData.idTokenClaims.tid');
-                                    }
-                                    
-                                    // Nếu tìm thấy đủ thông tin cần thiết, có thể dừng
-                                    if (result.user.userId && result.user.displayName && result.tenant.domain) {
-                                        break;
-                                    }
-                                } catch (e) {
-                                    result.debug.errors.push(`Error processing account data for ${accountKey}: ${e.message}`);
+                            // Check IdP - xác định tài khoản cá nhân
+                            if (accountData.idTokenClaims && accountData.idTokenClaims.idp) {
+                                result.idp = accountData.idTokenClaims.idp;
+                            }
+                            
+                            // Trích xuất userId - ưu tiên oid từ idTokenClaims
+                            if (accountData.idTokenClaims && accountData.idTokenClaims.oid) {
+                                result.user.userId = accountData.idTokenClaims.oid;
+                                result.dataSources.push('accountData.idTokenClaims.oid');
+                            } else if (accountData.localAccountId) {
+                                result.user.userId = accountData.localAccountId;
+                                result.dataSources.push('accountData.localAccountId');
+                            }
+                            
+                            // Trích xuất displayName - ưu tiên name từ idTokenClaims
+                            if (accountData.idTokenClaims && accountData.idTokenClaims.name) {
+                                result.user.displayName = accountData.idTokenClaims.name;
+                                result.dataSources.push('accountData.idTokenClaims.name');
+                            } else if (accountData.name) {
+                                result.user.displayName = accountData.name;
+                                result.dataSources.push('accountData.name');
+                            }
+                            
+                            // Trích xuất email/username
+                            if (accountData.username) {
+                                result.user.email = accountData.username;
+                                result.dataSources.push('accountData.username');
+                                
+                                // Lấy domain từ email nếu chưa có
+                                if (!result.tenant.domain && result.user.email.includes('@')) {
+                                    result.tenant.domain = result.user.email.split('@')[1];
+                                    result.dataSources.push('email_domain');
                                 }
                             }
-                        } else {
-                            result.debug.errors.push("No account keys found in known patterns");
+                        } catch (e) {
+                            result.debug.errors.push("Error processing account data: " + e.message);
                         }
-                    } catch (sessionStorageError) {
-                        result.debug.errors.push(`SessionStorage account extract error: ${sessionStorageError.message}`);
+                    } else {
+                        result.debug.errors.push("No account keys found");
                     }
                     
-                    // 3. Phương pháp từ ID Token (bổ sung)
-                    try {
-                        let idTokenKeys = [];
-                        let tokenKeysFound = false;
-                        
-                        // 3.1 Tìm qua msal.token.keys (chuẩn)
-                        const tokenKeysStr = sessionStorage.getItem('msal.token.keys');
-                        if (tokenKeysStr) {
+                    // 3. Tìm thông tin từ token - kiểm tra tất cả các key có thể
+                    let idTokenKeys = [];
+                    
+                    // Tìm tất cả các msal.token.keys có thể có
+                    Object.keys(sessionStorage).forEach(key => {
+                        if (key.includes('msal.token.keys')) {
                             try {
-                                const tokenKeys = JSON.parse(tokenKeysStr);
-                                if (tokenKeys && tokenKeys.idToken && tokenKeys.idToken.length > 0) {
-                                    idTokenKeys = tokenKeys.idToken;
-                                    tokenKeysFound = true;
-                                    result.debug.sessionStorage['msal.token.keys_parsed'] = true;
+                                const tokenKeysData = JSON.parse(sessionStorage.getItem(key));
+                                if (tokenKeysData && tokenKeysData.idToken && tokenKeysData.idToken.length > 0) {
+                                    idTokenKeys.push(...tokenKeysData.idToken);
+                                    result.debug.sessionStorage['token_keys_source'] = key;
                                 }
                             } catch (e) {
-                                result.debug.errors.push(`Error parsing msal.token.keys: ${e.message}`);
+                                result.debug.errors.push("Error parsing token keys from " + key + ": " + e.message);
                             }
                         }
+                    });
+                    
+                    // Phân tích JWT từ ID token
+                    if (idTokenKeys.length > 0) {
+                        result.debug.sessionStorage['id_token_keys_found'] = idTokenKeys.length;
                         
-                        // 3.2 Tìm qua các pattern khác nếu chưa tìm thấy
-                        if (!tokenKeysFound) {
-                            const tokenKeyPatterns = Object.keys(sessionStorage).filter(key => 
-                                key.includes('token.keys') || 
-                                key.includes('tokens.keys') ||
-                                key.includes('tokenkeys')
-                            );
-                            
-                            for (const keyPattern of tokenKeyPatterns) {
-                                try {
-                                    const data = sessionStorage.getItem(keyPattern);
-                                    if (data) {
-                                        const parsedData = JSON.parse(data);
-                                        if (parsedData && parsedData.idToken && parsedData.idToken.length > 0) {
-                                            idTokenKeys = parsedData.idToken;
-                                            tokenKeysFound = true;
-                                            result.debug.sessionStorage['alternative_token_keys'] = keyPattern;
-                                            break;
-                                        }
-                                    }
-                                } catch (e) {
-                                    result.debug.errors.push(`Error parsing alternative token key ${keyPattern}: ${e.message}`);
-                                }
-                            }
-                        }
-                        
-                        // 3.3 Nếu vẫn không tìm thấy, tìm trực tiếp các key phù hợp với pattern
-                        if (!tokenKeysFound) {
-                            const directTokenKeys = result.debug.storage_scan.sessionStorage.tokenKeys;
-                            if (directTokenKeys.length > 0) {
-                                idTokenKeys = directTokenKeys;
-                                tokenKeysFound = true;
-                                result.debug.sessionStorage['direct_token_keys_found'] = directTokenKeys.length;
-                            }
-                        }
-                        
-                        // 3.4 Phân tích JWT từ ID token nếu tìm thấy
-                        if (tokenKeysFound && idTokenKeys.length > 0) {
-                            result.debug.sessionStorage['id_token_keys_found'] = idTokenKeys.length;
-                            
-                            for (const tokenKey of idTokenKeys) {
-                                try {
-                                    const tokenDataStr = sessionStorage.getItem(tokenKey);
-                                    if (!tokenDataStr) continue;
+                        for (const tokenKey of idTokenKeys) {
+                            try {
+                                const tokenData = JSON.parse(sessionStorage.getItem(tokenKey) || '{}');
+                                if (tokenData.secret) {
+                                    const jwt = parseJwt(tokenData.secret);
+                                    result.debug.sessionStorage['jwt_parsed'] = true;
                                     
-                                    const tokenData = JSON.parse(tokenDataStr);
-                                    result.debug.sessionStorage[`token_data_for_${tokenKey.substring(0, 20)}`] = 'parsed';
-                                    
-                                    if (tokenData.secret) {
-                                        const jwt = parseJwt(tokenData.secret);
-                                        result.debug.sessionStorage[`jwt_for_${tokenKey.substring(0, 20)}`] = 'parsed';
-                                        
-                                        // Kiểm tra IdP nếu chưa có
-                                        if (!result.idp && jwt.idp) {
-                                            result.idp = jwt.idp;
-                                        }
-                                        
-                                        // Cập nhật thông tin nếu chưa có
-                                        if (!result.user.userId && jwt.oid) {
-                                            result.user.userId = jwt.oid;
-                                            result.dataSources.push('jwt.oid');
-                                        }
-                                        
-                                        if (!result.user.displayName && jwt.name) {
-                                            result.user.displayName = jwt.name;
-                                            result.dataSources.push('jwt.name');
-                                        }
-                                        
-                                        if (!result.user.email) {
-                                            if (jwt.upn) {
-                                                result.user.upn = jwt.upn;
-                                                result.user.email = jwt.upn;
-                                                result.dataSources.push('jwt.upn');
-                                            } else if (jwt.email) {
-                                                result.user.email = jwt.email;
-                                                result.dataSources.push('jwt.email');
-                                            } else if (jwt.preferred_username) {
-                                                result.user.email = jwt.preferred_username;
-                                                result.dataSources.push('jwt.preferred_username');
-                                            }
-                                        }
-                                        
-                                        if (!result.tenant.id && jwt.tid) {
-                                            result.tenant.id = jwt.tid;
-                                            result.dataSources.push('jwt.tid');
-                                        }
-                                        
-                                        // Thêm tìm kiếm domain từ email trong token
-                                        if (!result.tenant.domain) {
-                                            if (jwt.email && jwt.email.includes('@')) {
-                                                result.tenant.domain = jwt.email.split('@')[1];
-                                                result.dataSources.push('jwt.email_domain');
-                                            } else if (jwt.upn && jwt.upn.includes('@')) {
-                                                result.tenant.domain = jwt.upn.split('@')[1];
-                                                result.dataSources.push('jwt.upn_domain');
-                                            }
-                                        }
-                                        
-                                        // Nếu tìm thấy đủ thông tin cần thiết, có thể dừng
-                                        if (result.user.userId && result.user.displayName && result.tenant.domain) {
-                                            break;
-                                        }
+                                    // Kiểm tra IdP nếu chưa có
+                                    if (!result.idp && jwt.idp) {
+                                        result.idp = jwt.idp;
                                     }
-                                } catch (e) {
-                                    result.debug.errors.push(`Error processing token data for ${tokenKey}: ${e.message}`);
+                                    
+                                    // Cập nhật thông tin nếu chưa có
+                                    if (!result.user.userId && jwt.oid) {
+                                        result.user.userId = jwt.oid;
+                                        result.dataSources.push('jwt.oid');
+                                    }
+                                    
+                                    if (!result.user.displayName && jwt.name) {
+                                        result.user.displayName = jwt.name;
+                                        result.dataSources.push('jwt.name');
+                                    }
+                                    
+                                    if (!result.user.email && (jwt.upn || jwt.email || jwt.preferred_username)) {
+                                        result.user.email = jwt.upn || jwt.email || jwt.preferred_username;
+                                        result.dataSources.push('jwt.email');
+                                    }
+                                    
+                                    if (!result.tenant.id && jwt.tid) {
+                                        result.tenant.id = jwt.tid;
+                                        result.dataSources.push('jwt.tid');
+                                    }
+                                    
+                                    // Thêm tìm kiếm domain từ email trong token
+                                    if (!result.tenant.domain && jwt.email && jwt.email.includes('@')) {
+                                        result.tenant.domain = jwt.email.split('@')[1];
+                                        result.dataSources.push('jwt.email_domain');
+                                    } else if (!result.tenant.domain && jwt.upn && jwt.upn.includes('@')) {
+                                        result.tenant.domain = jwt.upn.split('@')[1];
+                                        result.dataSources.push('jwt.upn_domain');
+                                    }
+                                    
+                                    break; // Chỉ cần phân tích 1 token
                                 }
+                            } catch (e) {
+                                result.debug.errors.push("Error processing token: " + e.message);
                             }
-                        } else {
-                            result.debug.errors.push("No token keys found in known patterns");
                         }
-                    } catch (tokenError) {
-                        result.debug.errors.push(`Token extract error: ${tokenError.message}`);
+                    } else {
+                        result.debug.errors.push("No token keys found");
                     }
                     
-                    // 4. Tìm trong các key sessionStorage cụ thể khác (phương pháp bổ sung)
-                    try {
-                        if (!result.user.userId || !result.user.displayName || !result.tenant.domain) {
-                            // Quét các key có chứa thông tin người dùng
-                            const userDataKeys = result.debug.storage_scan.sessionStorage.userRelatedKeysFound.filter(k => 
-                                k.toLowerCase().includes('user') || 
-                                k.toLowerCase().includes('profile') || 
-                                k.toLowerCase().includes('authdata')
-                            );
-                            
-                            for (const key of userDataKeys) {
-                                try {
-                                    const value = sessionStorage.getItem(key);
-                                    if (!value || !value.startsWith('{')) continue;
-                                    
-                                    const userData = JSON.parse(value);
-                                    
-                                    // Tìm các thuộc tính phổ biến
-                                    if (!result.user.userId) {
-                                        const candidateId = userData.oid || userData.objectId || userData.userId || 
-                                                           (userData.user && userData.user.objectId) ||
-                                                           (userData.account && userData.account.objectId);
-                                        
-                                        if (candidateId && (candidateId.length === 36 || candidateId.includes('-'))) {
-                                            result.user.userId = candidateId;
-                                            result.dataSources.push(`sessionStorage.${key}.userId`);
-                                        }
-                                    }
-                                    
-                                    if (!result.user.displayName) {
-                                        const candidateName = userData.displayName || userData.name || 
-                                                            (userData.user && userData.user.displayName) ||
-                                                            (userData.account && userData.account.name);
-                                        
-                                        if (candidateName) {
-                                            result.user.displayName = candidateName;
-                                            result.dataSources.push(`sessionStorage.${key}.displayName`);
-                                        }
-                                    }
-                                    
-                                    if (!result.user.email) {
-                                        const candidateEmail = userData.email || userData.upn || userData.userPrincipalName ||
-                                                             (userData.user && userData.user.email) ||
-                                                             (userData.account && userData.account.username);
-                                        
-                                        if (candidateEmail && candidateEmail.includes('@')) {
-                                            result.user.email = candidateEmail;
-                                            result.dataSources.push(`sessionStorage.${key}.email`);
-                                            
-                                            // Lấy domain từ email nếu chưa có
-                                            if (!result.tenant.domain) {
-                                                result.tenant.domain = candidateEmail.split('@')[1];
-                                                result.dataSources.push(`sessionStorage.${key}.emailDomain`);
-                                            }
-                                        }
-                                    }
-                                    
-                                    if (!result.tenant.id) {
-                                        const candidateTenantId = userData.tid || userData.tenantId ||
-                                                               (userData.tenant && userData.tenant.id) ||
-                                                               (userData.account && userData.account.tenantId);
-                                        
-                                        if (candidateTenantId && (candidateTenantId.length === 36 || candidateTenantId.includes('-'))) {
-                                            result.tenant.id = candidateTenantId;
-                                            result.dataSources.push(`sessionStorage.${key}.tenantId`);
-                                        }
-                                    }
-                                    
-                                    // Nếu tìm thấy đủ thông tin cần thiết, có thể dừng
-                                    if (result.user.userId && result.user.displayName && result.tenant.domain) {
-                                        break;
-                                    }
-                                } catch (e) {
-                                    // Bỏ qua lỗi phân tích JSON
-                                }
-                            }
-                        }
-                    } catch (additionalError) {
-                        result.debug.errors.push(`Additional extraction error: ${additionalError.message}`);
-                    }
-                    
-                    // 5. BỔ SUNG: Tìm kiếm các API response trong sessionStorage (thường chứa thông tin người dùng)
-                    try {
-                        if (!result.user.userId || !result.user.displayName || !result.tenant.domain) {
-                            // Tìm kiếm các key chứa response API
-                            const apiResponseKeys = Object.keys(sessionStorage).filter(key => 
-                                key.includes('api') || key.includes('response') || key.includes('fetch') || key.includes('cache')
-                            );
-                            
-                            for (const key of apiResponseKeys) {
-                                try {
-                                    const value = sessionStorage.getItem(key);
-                                    if (!value || !value.startsWith('{')) continue;
-                                    
-                                    const apiData = JSON.parse(value);
-                                    
-                                    // Quét đệ quy để tìm thuộc tính chứa thông tin
-                                    const findUserInfo = (obj, path = '') => {
-                                        if (!obj || typeof obj !== 'object') return;
-                                        
-                                        // Kiểm tra các thuộc tính phổ biến
-                                        if (!result.user.userId && (obj.oid || obj.objectId)) {
-                                            result.user.userId = obj.oid || obj.objectId;
-                                            result.dataSources.push(`${path}.oid/objectId`);
-                                        }
-                                        
-                                        if (!result.user.displayName && (obj.displayName || obj.name)) {
-                                            result.user.displayName = obj.displayName || obj.name;
-                                            result.dataSources.push(`${path}.displayName/name`);
-                                        }
-                                        
-                                        if (!result.user.email && (obj.email || obj.upn || obj.userPrincipalName)) {
-                                            result.user.email = obj.email || obj.upn || obj.userPrincipalName;
-                                            result.dataSources.push(`${path}.email/upn`);
-                                            
-                                            // Lấy domain từ email nếu chưa có
-                                            if (!result.tenant.domain && result.user.email.includes('@')) {
-                                                result.tenant.domain = result.user.email.split('@')[1];
-                                                result.dataSources.push(`${path}.emailDomain`);
-                                            }
-                                        }
-                                        
-                                        if (!result.tenant.id && (obj.tid || obj.tenantId)) {
-                                            result.tenant.id = obj.tid || obj.tenantId;
-                                            result.dataSources.push(`${path}.tid/tenantId`);
-                                        }
-                                        
-                                        // Duyệt đệ quy các thuộc tính con
-                                        for (const prop in obj) {
-                                            if (obj[prop] && typeof obj[prop] === 'object') {
-                                                findUserInfo(obj[prop], `${path}.${prop}`);
-                                            }
-                                        }
-                                    };
-                                    
-                                    findUserInfo(apiData, `sessionStorage.${key}`);
-                                    
-                                    // Nếu tìm thấy đủ thông tin cần thiết, có thể dừng
-                                    if (result.user.userId && result.user.displayName && result.tenant.domain) {
-                                        break;
-                                    }
-                                } catch (e) {
-                                    // Bỏ qua lỗi phân tích JSON
-                                }
-                            }
-                        }
-                    } catch (apiResponseError) {
-                        result.debug.errors.push(`API response extraction error: ${apiResponseError.message}`);
-                    }
-                    
-                    // 6. Kiểm tra tính hợp lệ của userId (định dạng UUID)
+                    // 4. Kiểm tra tính hợp lệ của userId (định dạng UUID)
                     const isValidUUID = result.user.userId && 
                                     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(result.user.userId);
                     result.debug.isValidUUID = isValidUUID;
                                     
-                    // 7. Kiểm tra displayName và domain
+                    // 5. Kiểm tra displayName
                     const hasDisplayName = result.user.displayName !== undefined && 
-                                        result.user.displayName !== null && 
-                                        result.user.displayName.trim() !== '';
+                                        result.user.displayName !== null;
                     result.debug.hasDisplayName = hasDisplayName;
-                    
-                    const hasDomain = result.tenant.domain !== undefined && 
-                                    result.tenant.domain !== null && 
-                                    result.tenant.domain.trim() !== '';
-                    result.debug.hasDomain = hasDomain;
                                     
-                    // Đánh dấu tài khoản hợp lệ - CHỈ cần có userId dạng UUID VÀ displayName xác định VÀ domain
-                    result.isValid = isValidUUID && hasDisplayName && hasDomain;
+                    // Đánh dấu tài khoản hợp lệ - CHỈ cần có userId dạng UUID VÀ displayName xác định
+                    result.isValid = isValidUUID && hasDisplayName;
                     
                     // Thêm thông tin URL
                     result.debug.url = window.location.href;
                     result.debug.title = document.title;
                     
-                    // Thời gian thực thi
-                    result.debug.timing.end = Date.now();
-                    result.debug.timing.duration = result.debug.timing.end - result.debug.timing.start;
-                    
                 } catch (error) {
                     result.debug.errors.push("Critical error: " + error.message);
-                    result.debug.criticalError = error.stack || error.toString();
                 }
                 
                 return result;
@@ -3375,42 +3267,14 @@ class LoginVerifier:
             // Hàm phân tích JWT token
             function parseJwt(token) {
                 try {
-                    // Kiểm tra JWT hợp lệ - phải có ít nhất 2 dấu chấm để chia thành 3 phần
-                    if (!token || typeof token !== 'string' || !token.includes('.')) {
-                        return {};
-                    }
-                    
                     const base64Url = token.split('.')[1];
                     if (!base64Url) return {};
                     
-                    // Chuẩn hóa base64 (thay thế '-' bằng '+' và '_' bằng '/')
                     const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
-                    
-                    // Thêm padding nếu cần
-                    const paddedBase64 = base64.padEnd(base64.length + (4 - base64.length % 4) % 4, '=');
-                    
-                    // Decode base64
-                    try {
-                        // Cách 1: Dùng atob và escape
-                        const jsonPayload = decodeURIComponent(atob(paddedBase64).split('').map(function(c) {
-                            return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
-                        }).join(''));
-                        return JSON.parse(jsonPayload);
-                    } catch (atobError) {
-                        try {
-                            // Cách 2: Dùng TextDecoder (backup)
-                            const binary = window.atob(paddedBase64);
-                            const bytes = new Uint8Array(binary.length);
-                            for (let i = 0; i < binary.length; i++) {
-                                bytes[i] = binary.charCodeAt(i);
-                            }
-                            const decoder = new TextDecoder();
-                            const text = decoder.decode(bytes);
-                            return JSON.parse(text);
-                        } catch (e) {
-                            return {};
-                        }
-                    }
+                    const jsonPayload = decodeURIComponent(atob(base64).split('').map(function(c) {
+                        return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+                    }).join(''));
+                    return JSON.parse(jsonPayload);
                 } catch (e) {
                     return {};
                 }
@@ -3420,7 +3284,7 @@ class LoginVerifier:
             return extractCriticalAzureData();
             """
             
-            # Thực thi script được tối ưu với timeout tăng lên
+            # Thực thi script được tối ưu
             self.logger.debug("Thực thi script JavaScript để trích xuất dữ liệu từ storage")
             storage_result = driver.execute_script(optimized_script)
             script_time = time.time() - start_time
@@ -3443,36 +3307,6 @@ class LoginVerifier:
                 js_errors = debug_info.get('errors', [])
                 if js_errors:
                     self.logger.debug(f"JavaScript errors: {', '.join(js_errors[:3])}")
-                
-                # CÁCH TỐT HƠN: Thêm log cho tất cả các key tìm thấy trong localStorage và sessionStorage
-                storage_scan = debug_info.get('storage_scan', {})
-                if storage_scan:
-                    try:
-                        # Ghi log các key trong localStorage liên quan đến user
-                        local_user_keys = storage_scan.get('localStorage', {}).get('userRelatedKeysFound', [])
-                        if local_user_keys:
-                            local_keys_sample = local_user_keys[:5] if len(local_user_keys) > 5 else local_user_keys
-                            self.logger.debug(f"localStorage user-related keys ({len(local_user_keys)} total): {', '.join(local_keys_sample)}")
-                            
-                        # Ghi log các key trong sessionStorage liên quan đến user
-                        session_user_keys = storage_scan.get('sessionStorage', {}).get('userRelatedKeysFound', [])
-                        if session_user_keys:
-                            session_keys_sample = session_user_keys[:5] if len(session_user_keys) > 5 else session_user_keys
-                            self.logger.debug(f"sessionStorage user-related keys ({len(session_user_keys)} total): {', '.join(session_keys_sample)}")
-                            
-                        # Ghi log các key account 
-                        account_keys = storage_scan.get('sessionStorage', {}).get('accountKeys', [])
-                        if account_keys:
-                            account_keys_sample = account_keys[:3] if len(account_keys) > 3 else account_keys
-                            self.logger.debug(f"Account keys found ({len(account_keys)} total): {', '.join(account_keys_sample)}")
-                            
-                        # Ghi log các key token
-                        token_keys = storage_scan.get('sessionStorage', {}).get('tokenKeys', [])
-                        if token_keys:
-                            token_keys_sample = token_keys[:3] if len(token_keys) > 3 else token_keys
-                            self.logger.debug(f"Token keys found ({len(token_keys)} total): {', '.join(token_keys_sample)}")
-                    except Exception as scan_e:
-                        self.logger.debug(f"Error logging storage scan results: {str(scan_e)}")
                     
             # Xử lý kết quả trả về từ storage
             details["user_id"] = storage_result.get('user', {}).get('userId')
@@ -3484,29 +3318,17 @@ class LoginVerifier:
             details["data_source"] = ", ".join(storage_result.get('dataSources', [])[:3])
             details["idp"] = storage_result.get('idp')
             
-            # Thêm thông tin UPN nếu có (Phổ biến trong Azure AD)
-            details["upn"] = storage_result.get('user', {}).get('upn')
-            
-            # CÁCH TỐT HƠN: Ghi log chi tiết về dữ liệu tìm được
+            # Ghi log chi tiết về dữ liệu tìm được
             if details["user_id"] or details["display_name"] or details["domain_name"]:
-                log_parts = []
-                if details["user_id"]:
-                    log_parts.append(f"userId={details['user_id']}")
-                if details["display_name"]:
-                    log_parts.append(f"displayName={details['display_name']}")
-                if details["domain_name"]:
-                    log_parts.append(f"domain={details['domain_name']}")
-                if details["email"]:
-                    log_parts.append(f"email={details['email']}")
-                if details["tenant_id"]:
-                    log_parts.append(f"tenantId={details['tenant_id']}")
-                
-                self.logger.debug(f"Dữ liệu từ storage: {', '.join(log_parts)}")
+                self.logger.debug(
+                    f"Dữ liệu từ storage: userId={details['user_id']}, "
+                    f"displayName={details['display_name']}, domain={details['domain_name']}"
+                )
             else:
                 self.logger.debug("Không tìm thấy dữ liệu người dùng trong storage")
             
             # Kiểm tra định dạng UUID chuẩn
-            is_valid_uuid = bool(details["user_id"] and re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', details["user_id"], re.IGNORECASE))
+            is_valid_uuid = bool(details["user_id"] and re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', details["user_id"]))
             
             # Kiểm tra đủ thông tin cần thiết VÀ userId có định dạng UUID chuẩn
             api_check_status = bool(details["user_id"] and details["display_name"] and details["domain_name"] and is_valid_uuid)
@@ -3538,14 +3360,14 @@ class LoginVerifier:
                 self.logger.info(f"Kiểm tra API đã thực thi trong {end_time:.3f}s")
                 return False, details
             
-            # Trường hợp thiếu thông tin - ghi nhận chi tiết các trường bị thiếu
+            # Trường hợp thiếu thông tin
             elif details["user_id"] or details["display_name"] or details["domain_name"]:
                 missing = []
                 if not details["user_id"]: missing.append("user_id")
                 if not details["display_name"]: missing.append("display_name")
                 if not details["domain_name"]: missing.append("domain_name")
                 error_msg = f"Thiếu thông tin: {', '.join(missing)}"
-                self.logger.warning(error_msg)
+                self.logger.debug(error_msg)
                 details["api_error"] = error_msg
                 self.logger.info(f"Kiểm tra API đã thực thi trong {end_time:.3f}s")
                 return False, details
@@ -3553,7 +3375,7 @@ class LoginVerifier:
             # Không tìm thấy thông tin
             else:
                 error_msg = "Không tìm thấy thông tin người dùng trong storage"
-                self.logger.warning(error_msg)
+                self.logger.debug(error_msg)
                 details["api_error"] = error_msg
                 self.logger.info(f"Kiểm tra API đã thực thi trong {end_time:.3f}s")
                 return False, details
